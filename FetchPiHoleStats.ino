@@ -12,35 +12,60 @@ const char* password = "mostpeoplechoosetousegoodsecurity";
 const char* piholeIP   = "192.168.1.206";       // Your Pi-hole's local IP Address
 const char* appPassword   = "R8EzbEzNyZfvyLI7wZ7AE6ukV/G2RBWLacUTpmqGkVc="; // Paste token here (leave empty if password disabled)
 
+
+// HC-SR04 Pin Definitions
+const int trigPin = D2;
+const int echoPin = D3;
+
+// Proximity Settings
+const int wakeDistanceCm = 50;        // Distance threshold to turn on screen (in centimeters)
+const unsigned long screenTimeout = 10000; // Time to stay on after last detection (10 seconds)
+
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-String sessionID = ""; // Variable to hold the active dynamic SID
-unsigned long lastTime = 0;
-unsigned long delayInterval = 10000; // Refresh statistics every 10 seconds
+String sessionID = ""; 
+unsigned long lastNetworkCheck = 0;
+unsigned long networkInterval = 10000; // Fetch stats every 10 seconds
 
-// Draws a 4-bar signal graph in the upper-right corner of the screen
+unsigned long lastTriggerTime = 0;     // Tracks when a person was last seen
+bool screenIsOn = true;
+
+// Helper function to calculate distance using the HC-SR04
+long readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Measure the bounce-back duration in microseconds
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout limit
+  
+  // Calculate distance in centimeters (Speed of sound is ~343m/s)
+  long distance = duration * 0.034 / 2;
+  
+  if (distance == 0) return 999; // Return a large distance if sensor times out
+  return distance;
+}
+
 void drawWiFiSignal(int x, int y) {
   int32_t rssi = WiFi.RSSI();
   int numBars = 0;
-  
   if (rssi > -60) numBars = 4;
   else if (rssi > -70) numBars = 3;
   else if (rssi > -80) numBars = 2;
   else if (rssi > -90) numBars = 1;
   
-  // Draw 4 incremental vertical bars
-  // fillRect(x, y, width, height, color)
   for (int i = 0; i < 4; i++) {
-    int barHeight = (i + 1) * 2; // Bars get taller (2px, 4px, 6px, 8px)
-    int barX = x + (i * 3);      // Space bars 3 pixels apart
-    int barY = y + (8 - barHeight); // Align bars to the bottom edge
-    
+    int barHeight = (i + 1) * 2;
+    int barX = x + (i * 3);
+    int barY = y + (8 - barHeight);
     if (i < numBars) {
-      display.fillRect(barX, barY, 2, barHeight, SSD1306_WHITE); // Filled bar
+      display.fillRect(barX, barY, 2, barHeight, SSD1306_WHITE);
     } else {
-      display.drawRect(barX, barY, 2, barHeight, SSD1306_WHITE); // Empty outline bar
+      display.drawRect(barX, barY, 2, barHeight, SSD1306_WHITE);
     }
   }
 }
@@ -73,13 +98,7 @@ bool loginToPihole() {
 
 void fetchPiholeStats() {
   if (sessionID == "") {
-    if (!loginToPihole()) {
-      display.clearDisplay();
-      display.setCursor(0,0);
-      display.println("Auth Attempt Failed");
-      display.display();
-      return;
-    }
+    if (!loginToPihole()) return;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -104,38 +123,30 @@ void fetchPiholeStats() {
         
         display.clearDisplay();
         
-        // --- 3-PIXEL DOWNWARD SHIFT MODIFICATIONS ---
-        
-        // 1. Shifted header text down to Y=3 (was Y=0)
+        // Padded layout structure (Y+3 offset)
         display.setTextSize(1);
         display.setCursor(0, 3);
-        display.print("               ");
-        
-        // 2. Shifted Wi-Fi graph widget down to Y=3 (was Y=0)
+        display.print("PI-HOLE MONITOR");
         drawWiFiSignal(115, 3);
-        
-        // 3. Shifted horizontal divider line down to Y=13 (was Y=10)
         display.drawFastHLine(0, 13, 128, SSD1306_WHITE); 
         
-        // 4. Shifted data readout text down to Y=18 (was Y=15)
         display.setCursor(0, 18);
         display.printf("Queries: %ld\n", dns_queries);
         display.printf("Blocked: %ld\n", ads_blocked);
-        
-        // 5. Shifted secondary divider line down to Y=38 (was Y=36)
         display.drawFastHLine(0, 38, 128, SSD1306_WHITE); 
         
-        // 6. Shifted large percentage text down to Y=46 (was Y=44)
         display.setCursor(0, 46);
         display.setTextSize(2);
         display.printf("%0.1f%%\n", ads_percentage);
         
-        // 7. Shifted "Blocked" text label down to Y=51 (was Y=49)
         display.setTextSize(1);
         display.setCursor(84, 51);
         display.print("Blocked");
         
-        display.display();
+        // Only refresh the glass image buffer if the screen should actively be visible
+        if (screenIsOn) {
+          display.display();
+        }
       }
     } 
     else if (httpResponseCode == 401) {
@@ -147,24 +158,54 @@ void fetchPiholeStats() {
 
 void setup() {
   Serial.begin(115200);
+  
+  // Initialize HC-SR04 pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
   
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
+  display.setCursor(0,3);
   display.println("Connecting Wi-Fi...");
   display.display();
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) { delay(500); }
   
+  lastTriggerTime = millis(); // Initialize timer
   fetchPiholeStats();
 }
 
 void loop() {
   unsigned long currentTime = millis();
-  if (currentTime - lastTime >= delayInterval) {
-    fetchPiholeStats();
-    lastTime = currentTime;
+  
+  // 1. Constantly check the proximity sensor (every 200ms)
+  static unsigned long lastSensorCheck = 0;
+  if (currentTime - lastSensorCheck >= 200) {
+    lastSensorCheck = currentTime;
+    long distance = readDistance();
+    
+    if (distance < wakeDistanceCm) {
+      lastTriggerTime = currentTime; // Reset the idle countdown clock
+      if (!screenIsOn) {
+        screenIsOn = true;
+        display.ssd1306_command(SSD1306_DISPLAYON); // Wake the physical OLED hardware panel
+        fetchPiholeStats(); // Immediately draw fresh numbers
+      }
+    }
+  }
+  
+  // 2. Manage the sleep countdown timer
+  if (screenIsOn && (currentTime - lastTriggerTime >= screenTimeout)) {
+    screenIsOn = false;
+    display.ssd1306_command(SSD1306_DISPLAYOFF); // Put OLED glass panel to sleep mode
+  }
+  
+  // 3. Keep updating the data silently in the background every 10 seconds
+  if (currentTime - lastNetworkCheck >= networkInterval) {
+    lastNetworkCheck = currentTime;
+    fetchPiholeStats(); 
   }
 }
